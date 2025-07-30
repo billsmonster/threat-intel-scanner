@@ -1,0 +1,272 @@
+# Import necessary modules
+# By Derek Lenz
+import os  # Provides functions for interacting with the operating system
+import csv  # Used to read/write CSV files
+import json  # Provides functions to parse and dump JSON
+import time  # For sleeping between API calls to avoid rate limiting
+import sqlite3  # SQLite database for caching threat info
+import requests  # To make HTTP requests to APIs
+import matplotlib.pyplot as plt  # For plotting threat scores
+from typing import List, Dict  # For type annotations
+from rich.console import Console  # Rich console output
+from rich.table import Table  # Rich tables for formatted summaries
+from rich.progress import Progress  # Progress bar
+from rich.panel import Panel  # Styled panel for welcome banner
+from rich.text import Text  # Styled text
+
+# Initialize the Rich console for colored and formatted terminal output
+console = Console()
+
+# === Load API Key ===
+def get_api_key():
+    try:
+        from dotenv import load_dotenv  # Load environment variables from .env file
+        load_dotenv()  # Reads the .env file and loads environment variables
+        key = os.getenv("OTX_API_KEY")  # Get the OTX API key from environment
+        if not key:
+            console.print("[red]OTX_API_KEY not set. Please add it to a `.env` file.[/red]")
+            key = "PASTE_YOUR_KEY_HERE"  # Fallback placeholder
+        return key
+    except:
+        return "PASTE_YOUR_KEY_HERE"
+
+# Set headers for API calls
+OTX_API_KEY = get_api_key()
+HEADERS = {"X-OTX-API-KEY": OTX_API_KEY}
+
+# === Constants for file outputs and cache ===
+CACHE_DB = "threat_cache.db"  # SQLite DB file
+OUTPUT_CSV = "threat_report.csv"  # CSV report output
+OUTPUT_JSON = "threat_log.json"  # JSON log output
+OUTPUT_MD = "threat_report.md"  # Markdown summary
+INDICATORS = ["8.8.8.8", "1.1.1.1", "example.com"]  # Indicators to scan
+THREAT_THRESHOLD = 5  # Threshold for determining red/green bar color
+
+# === Display welcome banner ===
+def welcome_banner():
+    banner = Text("""
+===============================
+  Threat Intelligence Scanner
+  Powered by AlienVault OTX
+===============================
+""", style="bold cyan")
+    console.print(Panel(banner, expand=False))  # Show stylized banner
+
+# === Color code levels for terminal output ===
+def level_color(level: str) -> str:
+    return {
+        "Critical": "bold red",
+        "High": "bold orange1",
+        "Medium": "bold yellow",
+        "Low": "bold green"
+    }.get(level, "white")  # Default to white if level not matched
+
+# === Print detailed threat info for each indicator ===
+def print_detailed_result(r: Dict):
+    console.print(f"\n[bold underline cyan]Indicator:[/bold underline cyan] {r['indicator']}")
+    console.print(f"[bold]Threat Score:[/bold] {r['threat_score']:.1f} ({r['level']})", style=level_color(r["level"]))
+    if r["tags"]:
+        console.print(f"[bold]Tags:[/bold] {', '.join(r['tags'])}")
+    if r["pulses"]:
+        console.print(f"[bold]Pulses:[/bold]\n- " + "\n- ".join(r["pulses"]))
+    if r["references"]:
+        console.print(f"[bold]References:[/bold]\n- " + "\n- ".join(r["references"]))
+    geo = r.get("geo", {})
+    if geo:
+        console.print(f"[bold]Geolocation:[/bold] {geo.get('city', '')}, {geo.get('region', '')}, {geo.get('country', '')} | ISP: {geo.get('isp', '')}")
+
+# === Summary after all scans ===
+def final_summary(results: List[Dict]):
+    critical = sum(1 for r in results if r["level"] == "Critical")
+    high = sum(1 for r in results if r["level"] == "High")
+    safe = sum(1 for r in results if r["level"] == "Low")
+    console.print("\n[bold magenta]Scan Complete ✅[/bold magenta]")
+    console.print(f"Total Indicators Scanned: [bold]{len(results)}[/bold]")
+    console.print(f"Threats Detected: [bold red]{critical + high}[/bold red]")
+    console.print(f"  - Critical: [bold red]{critical}[/bold red], High: [bold orange1]{high}[/bold orange1]")
+    console.print(f"Safe Indicators: [bold green]{safe}[/bold green]")
+
+# === Convert threat score to threat level string ===
+def threat_level(score: float) -> str:
+    if score >= 80:
+        return "Critical"
+    elif score >= 50:
+        return "High"
+    elif score >= 20:
+        return "Medium"
+    return "Low"
+
+# === Use IP-API to get location data ===
+def enrich_with_geolocation(ip: str) -> dict:
+    try:
+        response = requests.get(f"http://ip-api.com/json/{ip}")
+        response.raise_for_status()  # Raise exception on bad response
+        geo = response.json()  # Parse JSON
+        return {
+            "country": geo.get("country", ""),
+            "region": geo.get("regionName", ""),
+            "city": geo.get("city", ""),
+            "isp": geo.get("isp", ""),
+        }
+    except:
+        return {"country": "", "region": "", "city": "", "isp": ""}  # Return blanks if failed
+
+# === Create the local SQLite database ===
+def init_db():
+    conn = sqlite3.connect(CACHE_DB)
+    c = conn.cursor()
+    c.execute("DROP TABLE IF EXISTS threats")  # Delete old table
+    c.execute("""CREATE TABLE threats (
+        indicator TEXT PRIMARY KEY,
+        threat_score INTEGER,
+        tags TEXT,
+        last_checked TEXT
+    )""")  # Create schema
+    conn.commit()
+    conn.close()
+
+# === Check if indicator already scanned ===
+def check_cache(indicator: str):
+    conn = sqlite3.connect(CACHE_DB)
+    c = conn.cursor()
+    c.execute("SELECT threat_score, tags FROM threats WHERE indicator=?", (indicator,))
+    row = c.fetchone()  # Get one row if exists
+    conn.close()
+    if row:
+        return {"threat_score": row[0], "tags": row[1].split(";")}
+    return None
+
+# === Save new threat data to cache ===
+def update_cache(indicator: str, score: int, tags: List[str]):
+    conn = sqlite3.connect(CACHE_DB)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO threats VALUES (?, ?, ?, datetime('now'))",
+              (indicator, score, ";".join(tags)))
+    conn.commit()
+    conn.close()
+
+# === Query AlienVault OTX API ===
+def query_otx(indicator: str, indicator_type: str = "IPv4"):
+    try:
+        url = f"https://otx.alienvault.com/api/v1/indicators/{indicator_type}/{indicator}/general"
+        response = requests.get(url, headers=HEADERS)
+        response.raise_for_status()
+        data = response.json()
+        pulses = data.get("pulse_info", {}).get("pulses", [])
+        tags = list({tag for pulse in pulses for tag in pulse.get("tags", [])})
+        references = list({ref for pulse in pulses for ref in pulse.get("references", [])})
+        threat_score = sum(2 if "malware" in pulse.get("tags", []) else 1 for pulse in pulses)
+        normalized_score = min(threat_score / 10.0, 1.0) * 100
+        update_cache(indicator, int(normalized_score), tags)
+        geo = enrich_with_geolocation(indicator) if indicator_type == "IPv4" else {}
+        return {
+            "indicator": indicator,
+            "threat_score": normalized_score,
+            "level": threat_level(normalized_score),
+            "tags": tags,
+            "pulses": [pulse["name"] for pulse in pulses],
+            "references": references[:3],
+            "geo": geo
+        }
+    except Exception as e:
+        console.print(f"[red]API error for {indicator}: {e}[/red]")
+        return None
+
+# === Display final summary table ===
+def print_summary(results: List[Dict]):
+    table = Table(title="Threat Intelligence Summary", header_style="bold magenta")
+    table.add_column("Indicator", style="cyan")
+    table.add_column("Score", style="green")
+    table.add_column("Level")
+    table.add_column("Country")
+    for r in results:
+        table.add_row(r["indicator"], f"{r['threat_score']:.1f}", r["level"], r.get("geo", {}).get("country", ""))
+    console.print(table)
+
+# === Export results to CSV ===
+def export_to_csv(results: List[Dict], filename: str):
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Indicator", "Score", "Level", "Tags", "Country", "ISP"])
+        for r in results:
+            geo = r.get("geo", {})
+            writer.writerow([
+                r["indicator"], f"{r['threat_score']:.1f}", r["level"],
+                ";".join(r["tags"]), geo.get("country", ""), geo.get("isp", "")
+            ])
+
+# === Export to JSON ===
+def export_to_json_log(results: list, filename: str):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+# === Export to Markdown ===
+def export_to_markdown(results: list, filename: str):
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("# Threat Report\n\n")
+        for r in results:
+            f.write(f"## {r['indicator']}\n")
+            f.write(f"- **Threat Score**: {r['threat_score']:.1f} ({r['level']})\n")
+            f.write(f"- **Tags**: {', '.join(r['tags'])}\n")
+            f.write(f"- **Pulses**: {', '.join(r['pulses'])}\n")
+            geo = r.get("geo", {})
+            f.write(f"- **Location**: {geo.get('city','')} {geo.get('region','')}, {geo.get('country','')}\n")
+            f.write(f"- **ISP**: {geo.get('isp','')}\n")
+            f.write(f"- **References**: {', '.join(r['references'])}\n\n")
+
+# === Plot a bar chart of threat scores ===
+def plot_threat_scores(results: List[Dict]):
+    plt.figure(figsize=(10, 5))
+    scores = [r["threat_score"] for r in results]
+    names = [r["indicator"] for r in results]
+    colors = ["red" if s >= THREAT_THRESHOLD else "green" for s in scores]
+    plt.bar(names, scores, color=colors)
+    plt.title("Threat Scores by Indicator")
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("Threat Score")
+    plt.tight_layout()
+    plt.show()
+
+# === Loop through and process each indicator ===
+def process_indicators(indicators: List[str]) -> List[Dict]:
+    results = []
+    with Progress() as progress:
+        task = progress.add_task("Scanning...", total=len(indicators))
+        for indicator in indicators:
+            t = "domain" if not indicator.replace(".", "").isdigit() else "IPv4"
+            cached = check_cache(indicator)
+            if cached:
+                results.append({
+                    "indicator": indicator,
+                    "threat_score": cached["threat_score"],
+                    "level": threat_level(cached["threat_score"]),
+                    "tags": cached["tags"],
+                    "pulses": ["(cached)"],
+                    "references": [],
+                    "geo": enrich_with_geolocation(indicator) if t == "IPv4" else {}
+                })
+            else:
+                result = query_otx(indicator, t)
+                if result:
+                    results.append(result)
+                time.sleep(1)  # Avoid rate limiting
+            progress.advance(task)
+    return results
+
+# === Main Function ===
+def main():
+    welcome_banner()  # Show welcome message
+    init_db()  # Create DB from scratch
+    results = process_indicators(INDICATORS)  # Scan all indicators
+    print_summary(results)  # Print summary table
+    for r in results:
+        print_detailed_result(r)  # Print each result in detail
+    export_to_csv(results, OUTPUT_CSV)  # Save results to CSV
+    export_to_json_log(results, OUTPUT_JSON)  # Save results to JSON
+    export_to_markdown(results, OUTPUT_MD)  # Save results to Markdown
+    final_summary(results)  # Print final summary
+    plot_threat_scores(results)  # Plot scores
+
+# Entry point
+if __name__ == "__main__":
+    main()
